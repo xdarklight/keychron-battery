@@ -33,6 +33,7 @@
 #define KEYCHRON_VENDOR_INTERFACE	4
 
 #define KEYCHRON_POLL_INTERVAL_MS	300000	/* 5 minutes */
+#define KEYCHRON_RETRY_POLL_MS		60000	/* 1 minute, while mouse not yet responding */
 #define KEYCHRON_USB_TIMEOUT_MS		1000
 #define KEYCHRON_RESPONSE_TIMEOUT_MS	500
 #define KEYCHRON_REPORT_SIZE		64
@@ -226,6 +227,31 @@ static int keychron_query_battery(struct keychron_device *kdev)
 	return ret;
 }
 
+static int keychron_register_battery(struct keychron_device *kdev)
+{
+	struct power_supply_config psy_cfg = {};
+
+	kdev->battery_desc.name = "keychron_mouse";
+	kdev->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
+	kdev->battery_desc.properties = keychron_battery_props;
+	kdev->battery_desc.num_properties = ARRAY_SIZE(keychron_battery_props);
+	kdev->battery_desc.get_property = keychron_battery_get_property;
+
+	psy_cfg.drv_data = kdev;
+
+	kdev->battery = power_supply_register(&kdev->hdev->dev,
+					      &kdev->battery_desc, &psy_cfg);
+	if (IS_ERR(kdev->battery)) {
+		int ret = PTR_ERR(kdev->battery);
+
+		hid_err(kdev->hdev, "failed to register power supply: %d\n", ret);
+		kdev->battery = NULL;
+		return ret;
+	}
+
+	return 0;
+}
+
 static void keychron_battery_work(struct work_struct *work)
 {
 	struct keychron_device *kdev = container_of(work, struct keychron_device,
@@ -233,7 +259,29 @@ static void keychron_battery_work(struct work_struct *work)
 	int battery;
 
 	battery = keychron_query_battery(kdev);
-	if (battery >= 0 && battery != kdev->battery_capacity) {
+
+	/*
+	 * The mouse is wireless and frequently asleep (notably at boot), so a
+	 * failed query is expected and transient. Keep polling on a shorter
+	 * interval until it responds rather than giving up — otherwise a single
+	 * miss leaves the battery unreported for the whole session.
+	 */
+	if (battery < 0) {
+		schedule_delayed_work(&kdev->battery_work,
+				      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
+		return;
+	}
+
+	/* First successful reading: register the power supply now. */
+	if (!kdev->battery) {
+		if (keychron_register_battery(kdev)) {
+			schedule_delayed_work(&kdev->battery_work,
+					      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
+			return;
+		}
+		kdev->battery_capacity = battery;
+		hid_info(kdev->hdev, "Keychron mouse battery: %d%%\n", battery);
+	} else if (battery != kdev->battery_capacity) {
 		kdev->battery_capacity = battery;
 		power_supply_changed(kdev->battery);
 		hid_dbg(kdev->hdev, "battery: %d%%\n", battery);
@@ -292,7 +340,6 @@ static int keychron_probe(struct hid_device *hdev,
 {
 	struct keychron_device *kdev;
 	struct usb_interface *intf;
-	struct power_supply_config psy_cfg = {};
 	int ret;
 	int battery;
 
@@ -363,39 +410,30 @@ static int keychron_probe(struct hid_device *hdev,
 		goto err_cleanup;
 	}
 
-	/* Test battery query */
-	battery = keychron_query_battery(kdev);
-	if (battery < 0) {
-		hid_info(hdev, "battery query failed (%d), device may not support battery reporting\n",
-			 battery);
-		ret = 0; /* Don't fail probe, just skip battery */
-		goto err_cleanup;
-	}
-
-	kdev->battery_capacity = battery;
-
-	/* Register power supply */
-	kdev->battery_desc.name = "keychron_mouse";
-	kdev->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
-	kdev->battery_desc.properties = keychron_battery_props;
-	kdev->battery_desc.num_properties = ARRAY_SIZE(keychron_battery_props);
-	kdev->battery_desc.get_property = keychron_battery_get_property;
-
-	psy_cfg.drv_data = kdev;
-
-	kdev->battery = power_supply_register(&hdev->dev, &kdev->battery_desc,
-					      &psy_cfg);
-	if (IS_ERR(kdev->battery)) {
-		ret = PTR_ERR(kdev->battery);
-		hid_err(hdev, "failed to register power supply: %d\n", ret);
-		goto err_cleanup;
-	}
-
 	INIT_DELAYED_WORK(&kdev->battery_work, keychron_battery_work);
-	schedule_delayed_work(&kdev->battery_work,
-			      msecs_to_jiffies(KEYCHRON_POLL_INTERVAL_MS));
 
-	hid_info(hdev, "Keychron mouse battery: %d%%\n", battery);
+	/*
+	 * Try an initial query so the battery shows up immediately when the
+	 * mouse is awake. A failure here is expected for a sleeping wireless
+	 * mouse and must NOT abort battery support: the poll worker keeps
+	 * retrying and registers the power supply on the first reading.
+	 */
+	battery = keychron_query_battery(kdev);
+	if (battery >= 0) {
+		ret = keychron_register_battery(kdev);
+		if (ret)
+			goto err_cleanup;
+		kdev->battery_capacity = battery;
+		hid_info(hdev, "Keychron mouse battery: %d%%\n", battery);
+		schedule_delayed_work(&kdev->battery_work,
+				      msecs_to_jiffies(KEYCHRON_POLL_INTERVAL_MS));
+	} else {
+		hid_info(hdev, "battery query failed (%d), mouse likely asleep; will keep polling\n",
+			 battery);
+		schedule_delayed_work(&kdev->battery_work,
+				      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
+	}
+
 	return 0;
 
 err_cleanup:
@@ -410,7 +448,8 @@ static void keychron_remove(struct hid_device *hdev)
 	if (kdev && kdev->owns_battery) {
 		cancel_delayed_work_sync(&kdev->battery_work);
 		usb_kill_urb(kdev->intr_urb);
-		power_supply_unregister(kdev->battery);
+		if (kdev->battery)
+			power_supply_unregister(kdev->battery);
 		keychron_cleanup_battery(kdev);
 	}
 
